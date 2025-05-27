@@ -1,3 +1,15 @@
+##
+# @file heading_visualizer.py
+# @brief Quaternion/Euler Angle Visualizer with ROS2 IMU integration and 3D visualization.
+#
+# This script provides a PyQt6 GUI for visualizing and converting between quaternion and Euler angles,
+# subscribing to ROS2 IMU topics, and displaying IMU data in real time. It features a 3D visualization
+# of orientation and extra IMU fields such as linear acceleration and angular velocity.
+#
+# @author Benjamin
+# @date 2025-05-26
+##
+
 import sys
 import math
 from PyQt6.QtWidgets import (
@@ -10,13 +22,28 @@ import pyqtgraph as pg
 import pyqtgraph.opengl as gl
 import numpy as np
 import math
+import yaml
 
 # ROS2 imports
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Imu
+from nav_msgs.msg import Odometry  # Add import for Odometry
 from rclpy.qos import QoSProfile, ReliabilityPolicy
+from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
+import tf2_ros
+from geometry_msgs.msg import PoseStamped
+import tf2_geometry_msgs  # <-- Add this line
+from builtin_interfaces.msg import Time as MsgTime
+from rclpy.time import Time
 
+# Force message registration for TF2
+import geometry_msgs.msg._pose_stamped
+
+##
+# @brief Convert quaternion to Euler angles (roll, pitch, yaw).
+# @param q Quaternion as [x, y, z, w].
+# @return List of Euler angles [roll, pitch, yaw] in degrees.
 def quaternion_to_euler(q):
     # q = [x, y, z, w]
     x, y, z, w = q
@@ -37,6 +64,10 @@ def quaternion_to_euler(q):
     # Convert to degrees
     return [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
 
+##
+# @brief Convert Euler angles to quaternion.
+# @param e Euler angles [roll, pitch, yaw] in degrees.
+# @return Quaternion as (x, y, z, w).
 def euler_to_quaternion(e):
     # e = [roll, pitch, yaw] in degrees
     roll, pitch, yaw = [math.radians(a) for a in e]
@@ -47,6 +78,11 @@ def euler_to_quaternion(e):
     w = np.cos(roll/2) * np.cos(pitch/2) * np.cos(yaw/2) + np.sin(roll/2) * np.sin(pitch/2) * np.sin(yaw/2)
     return x, y, z, w
 
+##
+# @brief Rotate a 3D vector by a quaternion.
+# @param v Vector [x, y, z].
+# @param q Quaternion [x, y, z, w].
+# @return Rotated vector [x, y, z].
 def rotate_vector_by_quaternion(v, q):
     # v: [x, y, z], q: [x, y, z, w]
     # Quaternion multiplication: q * v * q_conj
@@ -69,29 +105,52 @@ def rotate_vector_by_quaternion(v, q):
     fz = rz * cw + rw * cz + rx * cy - ry * cx
     return [fx, fy, fz]
 
+##
+# @class ROS2IMUFinder
+# @brief ROS2 node for discovering IMU topics.
 class ROS2IMUFinder(Node):
+    ##
+    # @brief Constructor for ROS2IMUFinder.
     def __init__(self):
         super().__init__('imu_finder')
         self.topics = []
 
+    ##
+    # @brief Find all available IMU and Odometry topics.
+    # @return List of tuples (topic_name, msg_type).
     def find_imu_topics(self):
         self.topics = []
         topic_list = self.get_topic_names_and_types()
         for name, types in topic_list:
             if 'sensor_msgs/msg/Imu' in types:
-                self.topics.append(name)
+                self.topics.append((name, 'Imu'))
+            elif 'nav_msgs/msg/Odometry' in types:
+                self.topics.append((name, 'Odometry'))
         return self.topics
 
+##
+# @class RefreshingComboBox
+# @brief QComboBox that refreshes its items when opened.
 class RefreshingComboBox(QComboBox):
+    ##
+    # @brief Constructor for RefreshingComboBox.
+    # @param refresh_callback Function to call before showing popup.
     def __init__(self, refresh_callback, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.refresh_callback = refresh_callback
 
+    ##
+    # @brief Override to refresh items before showing popup.
     def showPopup(self):
         self.refresh_callback()
         super().showPopup()
 
+##
+# @class QuaternionEulerWidget
+# @brief Main widget for quaternion/Euler visualization and IMU streaming.
 class QuaternionEulerWidget(QWidget):
+    ##
+    # @brief Constructor for QuaternionEulerWidget.
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Quaternion/Euler Angle Visualizer")
@@ -99,6 +158,9 @@ class QuaternionEulerWidget(QWidget):
         self.imu_sub = None
         self.extra_fields_visible = False
         self.extra_fields_widgets = []
+        self.selected_frame = None
+        self.tf_buffer = None
+        self.tf_listener = None
         self.init_ui()
         self.init_ros()
         self.update_graph()
@@ -108,6 +170,8 @@ class QuaternionEulerWidget(QWidget):
         self.ros_timer.timeout.connect(self.spin_ros)
         self.ros_timer.start(50)  # 20 Hz
 
+    ##
+    # @brief Initialize the user interface.
     def init_ui(self):
         main_layout = QVBoxLayout(self)
 
@@ -167,19 +231,28 @@ class QuaternionEulerWidget(QWidget):
         bottom_layout = QHBoxLayout()
         self.combo = RefreshingComboBox(self.refresh_topics)
         self.combo.setEditable(False)
-        self.combo.addItem("Select IMU topic...")
+        self.combo.addItem("Select topic...")
+
+        # --- Frame selection combo box ---
+        self.frame_combo = RefreshingComboBox(self.refresh_frames)
+        self.frame_combo.setEditable(False)
+        self.frame_combo.addItem("Select frame...")
+
         self.load_btn = QPushButton("Start Stream")
-        self.expand_btn = QPushButton("Show Extra IMU Fields")
+        self.expand_btn = QPushButton("Show Extra Fields")
         bottom_layout.addWidget(self.combo)
+        bottom_layout.addWidget(self.frame_combo)
         bottom_layout.addWidget(self.load_btn)
         bottom_layout.addWidget(self.expand_btn)
         main_layout.addLayout(bottom_layout)
 
         self.load_btn.clicked.connect(self.toggle_stream)
         self.expand_btn.clicked.connect(self.toggle_extra_fields)
+        self.frame_combo.currentIndexChanged.connect(self.on_frame_selected)
+        self.combo.activated.connect(self.on_topic_selected)  # <-- Add this line
 
         # Extra fields area (hidden by default)
-        self.extra_fields_group = QGroupBox("Other IMU Values")
+        self.extra_fields_group = QGroupBox("Other Values")
         self.extra_fields_layout = QVBoxLayout()
         self.extra_fields_group.setLayout(self.extra_fields_layout)
         self.extra_fields_group.setVisible(False)
@@ -187,6 +260,70 @@ class QuaternionEulerWidget(QWidget):
 
         self.setLayout(main_layout)
 
+    ##
+    # @brief Handle topic selection change.
+    def on_topic_selected(self, idx):
+        new_topic = self.combo.currentText()
+        # Only act if a real topic is selected, not empty, and it's different from the current streaming topic
+        if new_topic and new_topic != "Select topic..." and (
+            not hasattr(self, "current_streaming_topic") or new_topic != getattr(self, "current_streaming_topic", None)
+        ):
+            if self.load_btn.text() == "Stop Stream":
+                self.stop_stream()
+                self.set_textboxes_editable(False)
+                self.start_stream()
+            self.current_streaming_topic = new_topic
+        elif new_topic == "Select topic...":
+            # Optionally, stop stream if "Select topic..." is chosen
+            if self.load_btn.text() == "Stop Stream":
+                self.stop_stream()
+            self.current_streaming_topic = None
+
+    ##
+    # @brief Refresh the list of available frames.
+    def refresh_frames(self):
+        if self.tf_buffer is None:
+            return
+        self.frame_combo.clear()
+        self.frame_combo.addItem("Select frame...")
+        try:
+            yaml_str = self.tf_buffer.all_frames_as_yaml()
+            frames_dict = yaml.safe_load(yaml_str)
+            frames_set = set()
+            if isinstance(frames_dict, dict):
+                for child, info in frames_dict.items():
+                    frames_set.add(child)
+                    parent = info.get('parent', None)
+                    if parent:
+                        frames_set.add(parent)
+            for frame in sorted(frames_set):
+                self.frame_combo.addItem(frame)
+        except Exception as e:
+            print(f"Could not get frames: {e}")
+
+    ##
+    # @brief Handle frame selection.
+    def on_frame_selected(self, idx):
+        if self.frame_combo.currentText() == "Select frame...":
+            self.selected_frame = None
+        else:
+            self.selected_frame = self.frame_combo.currentText()
+
+    ##
+    # @brief Initialize ROS2 node and TF2 listener.
+    def init_ros(self):
+        rclpy.init(args=None)
+        self.ros_node = ROS2IMUFinder()
+        try:
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self.ros_node)
+        except Exception as e:
+            print(f"TF2 initialization failed: {e}")
+            self.tf_buffer = None
+            self.tf_listener = None
+
+    ##
+    # @brief Toggle IMU stream on/off.
     def toggle_stream(self):
         if self.load_btn.text() == "Start Stream":
             self.set_textboxes_editable(False)  # Make uneditable when streaming
@@ -195,6 +332,9 @@ class QuaternionEulerWidget(QWidget):
             self.set_textboxes_editable(True)   # Make editable when not streaming
             self.stop_stream()
 
+    ##
+    # @brief Set editability of text boxes.
+    # @param editable True to make editable, False to make read-only.
     def set_textboxes_editable(self, editable):
         # Quaternion text boxes
         for edit in self.quat_edits:
@@ -208,9 +348,11 @@ class QuaternionEulerWidget(QWidget):
                 for child in container.findChildren(QLineEdit):
                     child.setReadOnly(True)
 
+    ##
+    # @brief Start streaming IMU or Odometry data from selected topic.
     def start_stream(self):
         topic = self.combo.currentText()
-        if topic == "Select IMU topic...":
+        if topic == "Select topic...":
             return
 
         # Remove previous subscription if any
@@ -222,36 +364,130 @@ class QuaternionEulerWidget(QWidget):
         qos = QoSProfile(depth=10)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
 
-        def cb(msg):
-            self.last_imu_msg = msg  # Save the latest message
-            q = [msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w]
-            for i, val in enumerate(q):
-                self.quat_edits[i].blockSignals(True)
-                self.quat_edits[i].setText(str(val))
-                self.quat_edits[i].blockSignals(False)
-            self.on_quat_changed()
-            if self.extra_fields_visible:
-                self.update_extra_fields(msg)
-        self.imu_sub = self.ros_node.create_subscription(Imu, topic, cb, qos)
+        msg_type = self.topic_types.get(topic, 'Imu')
+
+        def transform_pose_quat(position, orientation, from_frame, to_frame, stamp):
+            if self.tf_buffer is None or to_frame is None or to_frame == "Select frame...":
+                return position, orientation, True
+            if not from_frame:
+                print("No frame_id in message!")
+                return position, orientation, False
+            try:
+                pose = PoseStamped()
+                pose.header.frame_id = from_frame
+                # Ensure stamp is a builtin_interfaces.msg.Time
+                if hasattr(stamp, 'to_msg'):
+                    pose.header.stamp = stamp.to_msg()
+                elif isinstance(stamp, MsgTime):
+                    pose.header.stamp = stamp
+                else:
+                    pose.header.stamp = MsgTime()
+                pose.pose.position.x = float(position[0])
+                pose.pose.position.y = float(position[1])
+                pose.pose.position.z = float(position[2])
+                pose.pose.orientation.x = float(orientation[0])
+                pose.pose.orientation.y = float(orientation[1])
+                pose.pose.orientation.z = float(orientation[2])
+                pose.pose.orientation.w = float(orientation[3])
+                # Try with message timestamp
+                if self.tf_buffer.can_transform(to_frame, from_frame, pose.header.stamp):
+                    tf_pose = self.tf_buffer.transform(pose, to_frame, timeout=rclpy.duration.Duration(seconds=0.5))
+                else:
+                    # Try with latest transform
+                    print("Trying with latest transform (time=0)")
+                    pose.header.stamp = Time().to_msg()
+                    if self.tf_buffer.can_transform(to_frame, from_frame, pose.header.stamp):
+                        tf_pose = self.tf_buffer.transform(pose, to_frame, timeout=rclpy.duration.Duration(seconds=0.5))
+                    else:
+                        print(f"No transform from {from_frame} to {to_frame} at time {stamp} or latest")
+                        return position, orientation, False
+                pos = [tf_pose.pose.position.x, tf_pose.pose.position.y, tf_pose.pose.position.z]
+                quat = [tf_pose.pose.orientation.x, tf_pose.pose.orientation.y, tf_pose.pose.orientation.z, tf_pose.pose.orientation.w]
+                return pos, quat, True
+            except Exception as e:
+                print(f"Transform error: {e}")
+                return position, orientation, False
+
+        if msg_type == 'Imu':
+            def cb(msg):
+                self.last_imu_msg = msg
+                self.last_odom_msg = None
+                q = [msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w]
+                pos = [0, 0, 0]
+                frame_id = getattr(msg.header, "frame_id", "")
+                stamp = getattr(msg.header, "stamp", rclpy.time.Time())
+                error = False
+                if self.selected_frame:
+                    pos, q, ok = transform_pose_quat(pos, q, frame_id, self.selected_frame, stamp)
+                    error = not ok
+                if error:
+                    for edit in self.quat_edits:
+                        edit.blockSignals(True)
+                        edit.setText("ERROR")
+                        edit.blockSignals(False)
+                else:
+                    for i, val in enumerate(q):
+                        self.quat_edits[i].blockSignals(True)
+                        self.quat_edits[i].setText(str(val))
+                        self.quat_edits[i].blockSignals(False)
+                self.on_quat_changed()
+                if self.extra_fields_visible:
+                    self.update_extra_fields(msg)
+            self.imu_sub = self.ros_node.create_subscription(Imu, topic, cb, qos)
+        else:  # Odometry
+            def cb(msg):
+                self.last_odom_msg = msg
+                self.last_imu_msg = None
+                q = [msg.pose.pose.orientation.x, msg.pose.pose.orientation.y,
+                     msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]
+                pos = [msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z]
+                frame_id = getattr(msg.header, "frame_id", "")
+                stamp = getattr(msg.header, "stamp", rclpy.time.Time())
+                error = False
+                if self.selected_frame:
+                    pos, q, ok = transform_pose_quat(pos, q, frame_id, self.selected_frame, stamp)
+                    error = not ok
+                if error:
+                    for edit in self.quat_edits:
+                        edit.blockSignals(True)
+                        edit.setText("ERROR")
+                        edit.blockSignals(False)
+                else:
+                    for i, val in enumerate(q):
+                        self.quat_edits[i].blockSignals(True)
+                        self.quat_edits[i].setText(str(val))
+                        self.quat_edits[i].blockSignals(False)
+                self.on_quat_changed()
+                if self.extra_fields_visible:
+                    self.update_extra_fields(msg)
+            self.imu_sub = self.ros_node.create_subscription(Odometry, topic, cb, qos)
+
         self.load_btn.setText("Stop Stream")
 
+    ##
+    # @brief Stop streaming IMU data.
     def stop_stream(self):
         if self.imu_sub is not None:
             self.ros_node.destroy_subscription(self.imu_sub)
             self.imu_sub = None
         self.load_btn.setText("Start Stream")
 
+    ##
+    # @brief Toggle visibility of extra IMU fields.
     def toggle_extra_fields(self):
         self.extra_fields_visible = not self.extra_fields_visible
         self.extra_fields_group.setVisible(self.extra_fields_visible)
         if self.extra_fields_visible:
-            self.expand_btn.setText("Hide Extra IMU Fields")
+            self.expand_btn.setText("Hide Extra Fields")
             self.update_extra_fields()
             self.resize(1000, 800)
         else:
-            self.expand_btn.setText("Show Extra IMU Fields")
+            self.expand_btn.setText("Show Extra Fields")
             self.resize(800, 600)
 
+    ##
+    # @brief Update extra IMU fields display.
+    # @param msg Optional IMU message.
     def update_extra_fields(self, msg=None):
         # Remove old widgets
         for widget in self.extra_fields_widgets:
@@ -259,89 +495,136 @@ class QuaternionEulerWidget(QWidget):
             widget.deleteLater()
         self.extra_fields_widgets = []
 
-        # Create horizontal layout for two columns
-        columns_layout = QHBoxLayout()
-        lin_accel_layout = QVBoxLayout()
-        ang_vel_layout = QVBoxLayout()
+        # Determine which message to use
+        m_imu = getattr(self, 'last_imu_msg', None)
+        m_odom = getattr(self, 'last_odom_msg', None)
 
-        # If no message, just show empty fields
-        if not hasattr(self, 'last_imu_msg') or self.last_imu_msg is None:
+        if m_imu is not None:
+            # IMU fields
+            columns_layout = QHBoxLayout()
+            lin_accel_layout = QVBoxLayout()
+            ang_vel_layout = QVBoxLayout()
             lin_fields = [
-                ("Linear Acceleration X", ""),
-                ("Linear Acceleration Y", ""),
-                ("Linear Acceleration Z", ""),
+                ("Linear Acceleration X", f"{m_imu.linear_acceleration.x:.6f}"),
+                ("Linear Acceleration Y", f"{m_imu.linear_acceleration.y:.6f}"),
+                ("Linear Acceleration Z", f"{m_imu.linear_acceleration.z:.6f}"),
             ]
             ang_fields = [
-                ("Angular Velocity X", ""),
-                ("Angular Velocity Y", ""),
-                ("Angular Velocity Z", ""),
+                ("Angular Velocity X", f"{m_imu.angular_velocity.x:.6f}"),
+                ("Angular Velocity Y", f"{m_imu.angular_velocity.y:.6f}"),
+                ("Angular Velocity Z", f"{m_imu.angular_velocity.z:.6f}"),
             ]
+            for label, value in lin_fields:
+                h = QHBoxLayout()
+                lbl = QLabel(label)
+                edit = QLineEdit(value)
+                edit.setReadOnly(True)
+                h.addWidget(lbl)
+                h.addWidget(edit)
+                container = QWidget()
+                container.setLayout(h)
+                lin_accel_layout.addWidget(container)
+                self.extra_fields_widgets.append(container)
+            for label, value in ang_fields:
+                h = QHBoxLayout()
+                lbl = QLabel(label)
+                edit = QLineEdit(value)
+                edit.setReadOnly(True)
+                h.addWidget(lbl)
+                h.addWidget(edit)
+                container = QWidget()
+                container.setLayout(h)
+                ang_vel_layout.addWidget(container)
+                self.extra_fields_widgets.append(container)
+            columns_layout.addLayout(lin_accel_layout)
+            columns_layout.addLayout(ang_vel_layout)
+            # Remove old layout widgets if any
+            while self.extra_fields_layout.count():
+                item = self.extra_fields_layout.takeAt(0)
+                widget = item.widget()
+                if widget:
+                    widget.deleteLater()
+            self.extra_fields_layout.addLayout(columns_layout)
+        elif m_odom is not None:
+            # Odometry fields (except covariance)
+            odom_fields = [
+                ("Position X", f"{m_odom.pose.pose.position.x:.6f}"),
+                ("Position Y", f"{m_odom.pose.pose.position.y:.6f}"),
+                ("Position Z", f"{m_odom.pose.pose.position.z:.6f}"),
+                ("Orientation X", f"{m_odom.pose.pose.orientation.x:.6f}"),
+                ("Orientation Y", f"{m_odom.pose.pose.orientation.y:.6f}"),
+                ("Orientation Z", f"{m_odom.pose.pose.orientation.z:.6f}"),
+                ("Orientation W", f"{m_odom.pose.pose.orientation.w:.6f}"),
+                ("Linear Velocity X", f"{m_odom.twist.twist.linear.x:.6f}"),
+                ("Linear Velocity Y", f"{m_odom.twist.twist.linear.y:.6f}"),
+                ("Linear Velocity Z", f"{m_odom.twist.twist.linear.z:.6f}"),
+                ("Angular Velocity X", f"{m_odom.twist.twist.angular.x:.6f}"),
+                ("Angular Velocity Y", f"{m_odom.twist.twist.angular.y:.6f}"),
+                ("Angular Velocity Z", f"{m_odom.twist.twist.angular.z:.6f}"),
+            ]
+            layout = QVBoxLayout()
+            for label, value in odom_fields:
+                h = QHBoxLayout()
+                lbl = QLabel(label)
+                edit = QLineEdit(value)
+                edit.setReadOnly(True)
+                h.addWidget(lbl)
+                h.addWidget(edit)
+                container = QWidget()
+                container.setLayout(h)
+                layout.addWidget(container)
+                self.extra_fields_widgets.append(container)
+            # Remove old layout widgets if any
+            while self.extra_fields_layout.count():
+                item = self.extra_fields_layout.takeAt(0)
+                widget = item.widget()
+                if widget:
+                    widget.deleteLater()
+            self.extra_fields_layout.addLayout(layout)
         else:
-            m = self.last_imu_msg
-            lin_fields = [
-                ("Linear Acceleration X", f"{m.linear_acceleration.x:.6f}"),
-                ("Linear Acceleration Y", f"{m.linear_acceleration.y:.6f}"),
-                ("Linear Acceleration Z", f"{m.linear_acceleration.z:.6f}"),
-            ]
-            ang_fields = [
-                ("Angular Velocity X", f"{m.angular_velocity.x:.6f}"),
-                ("Angular Velocity Y", f"{m.angular_velocity.y:.6f}"),
-                ("Angular Velocity Z", f"{m.angular_velocity.z:.6f}"),
-            ]
+            # No message, show empty fields
+            layout = QVBoxLayout()
+            for label in [
+                "Position X", "Position Y", "Position Z",
+                "Orientation X", "Orientation Y", "Orientation Z", "Orientation W",
+                "Linear Velocity X", "Linear Velocity Y", "Linear Velocity Z",
+                "Angular Velocity X", "Angular Velocity Y", "Angular Velocity Z"
+            ]:
+                h = QHBoxLayout()
+                lbl = QLabel(label)
+                edit = QLineEdit("")
+                edit.setReadOnly(True)
+                h.addWidget(lbl)
+                h.addWidget(edit)
+                container = QWidget()
+                container.setLayout(h)
+                layout.addWidget(container)
+                self.extra_fields_widgets.append(container)
+            while self.extra_fields_layout.count():
+                item = self.extra_fields_layout.takeAt(0)
+                widget = item.widget()
+                if widget:
+                    widget.deleteLater()
+            self.extra_fields_layout.addLayout(layout)
 
-        # Add linear acceleration fields (left)
-        for label, value in lin_fields:
-            h = QHBoxLayout()
-            lbl = QLabel(label)
-            edit = QLineEdit(value)
-            edit.setReadOnly(True)
-            h.addWidget(lbl)
-            h.addWidget(edit)
-            container = QWidget()
-            container.setLayout(h)
-            lin_accel_layout.addWidget(container)
-            self.extra_fields_widgets.append(container)
-
-        # Add angular velocity fields (right)
-        for label, value in ang_fields:
-            h = QHBoxLayout()
-            lbl = QLabel(label)
-            edit = QLineEdit(value)
-            edit.setReadOnly(True)
-            h.addWidget(lbl)
-            h.addWidget(edit)
-            container = QWidget()
-            container.setLayout(h)
-            ang_vel_layout.addWidget(container)
-            self.extra_fields_widgets.append(container)
-
-        # Add both columns to the horizontal layout
-        columns_layout.addLayout(lin_accel_layout)
-        columns_layout.addLayout(ang_vel_layout)
-
-        # Set the new layout for the extra fields group
-        # Remove old layout widgets if any
-        while self.extra_fields_layout.count():
-            item = self.extra_fields_layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
-        self.extra_fields_layout.addLayout(columns_layout)
-
-    def init_ros(self):
-        rclpy.init(args=None)
-        self.ros_node = ROS2IMUFinder()
-
+    ##
+    # @brief Refresh the list of available IMU and Odometry topics.
     def refresh_topics(self):
         self.combo.clear()
-        self.combo.addItem("Select IMU topic...")
+        self.combo.addItem("Select topic...")
+        self.topic_types = {}  # Map topic name to type
         topics = self.ros_node.find_imu_topics()
-        for t in topics:
+        for t, typ in topics:
             self.combo.addItem(t)
+            self.topic_types[t] = typ
 
+    ##
+    # @brief Spin the ROS2 node once (process callbacks).
     def spin_ros(self):
         rclpy.spin_once(self.ros_node, timeout_sec=0)
 
+    ##
+    # @brief Handle changes in quaternion text boxes.
     def on_quat_changed(self):
         try:
             q = [float(edit.text()) for edit in self.quat_edits]
@@ -352,6 +635,8 @@ class QuaternionEulerWidget(QWidget):
         except Exception:
             pass
 
+    ##
+    # @brief Handle changes in Euler angle text boxes.
     def on_euler_changed(self):
         try:
             e = [float(edit.text()) for edit in self.euler_edits]
@@ -364,6 +649,8 @@ class QuaternionEulerWidget(QWidget):
         except Exception:
             pass
 
+    ##
+    # @brief Update the 3D graph visualization.
     def update_graph(self):
         self.graph_widget.clear()
         try:
@@ -398,10 +685,15 @@ class QuaternionEulerWidget(QWidget):
         except Exception:
             pass
 
+    ##
+    # @brief Handle widget close event (shutdown ROS2).
+    # @param event Close event.
     def closeEvent(self, event):
         rclpy.shutdown()
         event.accept()
 
+##
+# @brief Main entry point for the application.
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     w = QuaternionEulerWidget()
