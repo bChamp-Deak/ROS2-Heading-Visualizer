@@ -17,5 +17,3 @@ You can also do this live on a ROS2 topic by:
   - Optionally select a frame to transform the topic into. By default, no frame will be used
   - Press Start Stream. The Quaternion and Eular angles will be updated as they are received
   - If you want to see more information about the topic, press Show Extra Fields button.
-
-An example program is included that will publish an IMU topic that sweeps its values through each axis. To run this, download imu_publisher.py and run it.
