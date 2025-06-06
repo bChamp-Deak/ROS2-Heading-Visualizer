@@ -1,7 +1,7 @@
 ##
 # @file imu_publisher_test.py
-# @brief This script publishes some fummy IMU data to be able to test the GUI program
-# @author Benjamin
+# @brief This script publishes some dummy IMU data to be able to test the GUI program
+# @author Benjamin Champion
 # @date 2025-06-06
 ##
 
