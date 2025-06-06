@@ -1,3 +1,10 @@
+##
+# @file imu_publisher_test.py
+# @brief This script publishes some fummy IMU data to be able to test the GUI program
+# @author Benjamin
+# @date 2025-06-06
+##
+
 import rclpy  # ROS2 Python client library
 from rclpy.node import Node  # Base class for ROS2 nodes
 from sensor_msgs.msg import Imu  # IMU message type
