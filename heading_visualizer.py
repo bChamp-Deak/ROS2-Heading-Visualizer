@@ -6,7 +6,7 @@
 # subscribing to ROS2 IMU topics, and displaying IMU data in real time. It features a 3D visualization
 # of orientation and extra IMU fields such as linear acceleration and angular velocity.
 #
-# @author Benjamin
+# @author Benjamin Champion
 # @date 2025-05-26
 ##
 
