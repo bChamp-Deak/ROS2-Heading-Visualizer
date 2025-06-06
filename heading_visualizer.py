@@ -14,9 +14,9 @@ import sys
 import math
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QLineEdit, QPushButton, QComboBox, QGroupBox
+    QLineEdit, QPushButton, QComboBox, QGroupBox, QCheckBox  # <-- Add QCheckBox
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QPointF
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush
 import pyqtgraph as pg
 import pyqtgraph.opengl as gl
@@ -43,7 +43,7 @@ import geometry_msgs.msg._pose_stamped
 # @brief Convert quaternion to Euler angles (roll, pitch, yaw).
 # @param q Quaternion as [x, y, z, w].
 # @return List of Euler angles [roll, pitch, yaw] in degrees.
-def quaternion_to_euler(q):
+def quaternion_to_euler(q):  
     # Unpack quaternion
     x, y, z, w = q
 
@@ -51,7 +51,7 @@ def quaternion_to_euler(q):
     t0 = +2.0 * (w * x + y * z)
     t1 = +1.0 - 2.0 * (x * x + y * y)
     roll = math.atan2(t0, t1)
-    
+
     # Calculate pitch (y-axis rotation)
     t2 = +2.0 * (w * y - z * x)
     t2 = +1.0 if t2 > +1.0 else t2  # Clamp value
@@ -184,6 +184,7 @@ class QuaternionEulerWidget(QWidget):
         self.selected_frame = None
         self.tf_buffer = None
         self.tf_listener = None
+        self.normalize_quat = False  # Track checkbox state
         self.init_ui()
         self.init_ros()
         self.update_graph()
@@ -249,6 +250,11 @@ class QuaternionEulerWidget(QWidget):
         self.graph_widget = gl.GLViewWidget()
         self.graph_widget.setCameraPosition(distance=5)
         graph_layout.addWidget(self.graph_widget, stretch=1)
+
+        # Add Artificial Horizon next to the 3D graph
+        self.horizon_widget = ArtificialHorizonWidget()
+        graph_layout.addWidget(self.horizon_widget, stretch=0)
+
         main_layout.addLayout(graph_layout)
 
         # --- Topic and frame selection, buttons ---
@@ -263,6 +269,13 @@ class QuaternionEulerWidget(QWidget):
 
         self.load_btn = QPushButton("Start Stream")
         self.expand_btn = QPushButton("Show Extra Fields")
+
+        # Add normalization checkbox
+        self.normalize_checkbox = QCheckBox("Normalize Quaternion")
+        self.normalize_checkbox.setChecked(False)
+        self.normalize_checkbox.stateChanged.connect(self.on_normalize_checkbox_changed)
+        bottom_layout.addWidget(self.normalize_checkbox)
+
         bottom_layout.addWidget(self.combo)
         bottom_layout.addWidget(self.frame_combo)
         bottom_layout.addWidget(self.load_btn)
@@ -713,6 +726,11 @@ class QuaternionEulerWidget(QWidget):
         try:
             # Read quaternion values from text boxes
             q = [float(edit.text()) for edit in self.quat_edits]
+            # Normalize if checkbox is checked
+            if self.normalize_quat:
+                norm = math.sqrt(sum(x*x for x in q))
+                if norm > 0:
+                    q = [x / norm for x in q]
             # Convert to Euler angles
             e = quaternion_to_euler(q)
             # Update Euler angle text boxes
@@ -738,6 +756,13 @@ class QuaternionEulerWidget(QWidget):
             self.update_graph()
         except Exception:
             pass
+
+    ##
+    # @brief Handle normalization checkbox state change.
+    # @param state The new state of the checkbox.
+    def on_normalize_checkbox_changed(self, state):
+        self.normalize_quat = self.normalize_checkbox.isChecked()
+        self.on_quat_changed()  # Update display with normalization if needed
 
     ##
     # @brief Update the 3D graph visualization.
@@ -774,6 +799,11 @@ class QuaternionEulerWidget(QWidget):
             pos = [tuple(pts[0]), tuple(pts[1])]
             angle_line = gl.GLLinePlotItem(pos=pos, color=(1,0,1,1), width=4, antialias=True)
             self.graph_widget.addItem(angle_line)
+
+            # Update artificial horizon with roll and pitch
+            roll = float(self.euler_edits[0].text())
+            pitch = float(self.euler_edits[1].text())
+            self.horizon_widget.set_angles(roll, pitch)
         except Exception:
             pass
 
@@ -783,6 +813,81 @@ class QuaternionEulerWidget(QWidget):
     def closeEvent(self, event):
         rclpy.shutdown()
         event.accept()
+
+##
+# @brief A QWidget that draws an artificial horizon (attitude indicator) showing roll and pitch.
+class ArtificialHorizonWidget(QWidget):
+    """
+    @brief A QWidget that draws an artificial horizon (attitude indicator) showing roll and pitch.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.setMinimumSize(180, 180)
+        self.setMaximumSize(200, 200)
+
+    """
+    @brief Set the roll and pitch angles (in degrees) and update the display.
+    @param roll Roll angle in degrees.
+    @param pitch Pitch angle in degrees.
+    """
+    def set_angles(self, roll, pitch):
+        self.roll = roll
+        self.pitch = pitch
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        cx, cy = w // 2, h // 2
+        radius = min(w, h) // 2 - 10
+
+        # Convert angles to radians
+        roll_rad = math.radians(self.roll)
+        pitch_rad = math.radians(self.pitch)
+
+        N = 200
+        sky_points = []
+        ground_points = []
+
+        # "Ball" effect: pitch rotates the horizon around the x axis
+        for i in range(N + 1):
+            theta = 2 * math.pi * i / N
+            x0 = math.cos(theta)
+            y0 = math.sin(theta)
+            # Apply pitch (rotation around x axis)
+            x1 = x0
+            y1 = y0 * math.cos(pitch_rad)
+            # Project to 2D
+            sky_points.append(QPointF(cx + radius * x1, cy - radius * y1))
+            ground_points.append(QPointF(cx + radius * x1, cy - radius * y1))
+
+        # Draw sky (top half)
+        painter.save()
+        painter.translate(cx, cy)
+        painter.rotate(-self.roll)
+        painter.translate(-cx, -cy)
+        painter.setBrush(QBrush(QColor(100, 180, 255)))
+        painter.setPen(QPen(QColor(100, 180, 255)))
+        painter.drawPolygon(sky_points[:N//2+1] + [QPointF(cx, cy)])
+        # Draw ground (bottom half)
+        painter.setBrush(QBrush(QColor(200, 120, 60)))
+        painter.setPen(QPen(QColor(200, 120, 60)))
+        painter.drawPolygon(ground_points[N//2:] + [QPointF(cx, cy)])
+        painter.restore()
+
+        # Draw outer circle
+        painter.setPen(QPen(QColor(0,0,0), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(cx - radius, cy - radius, 2*radius, 2*radius)
+
+        # Draw fixed airplane symbol
+        painter.setPen(QPen(QColor(0,0,0), 3))
+        painter.drawLine(cx - 30, cy, cx + 30, cy)
+        painter.drawLine(cx, cy - 10, cx, cy + 10)
+        painter.end()
 
 ##
 # @brief Main entry point for the application.
